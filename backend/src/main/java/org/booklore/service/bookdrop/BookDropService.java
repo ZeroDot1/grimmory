@@ -40,7 +40,12 @@ import org.springframework.core.io.Resource;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.File;
@@ -76,6 +81,7 @@ public class BookDropService {
     private final FileMovingHelper fileMovingHelper;
     private final MonitoringRegistrationService monitoringRegistrationService;
     private final ApplicationEventPublisher eventPublisher;
+    private final PlatformTransactionManager transactionManager;
 
     private static final int CHUNK_SIZE = 100;
 
@@ -246,7 +252,7 @@ public class BookDropService {
                         totalFilesProcessed.incrementAndGet();
                         continue;
                     }
-                    processFile(file, metadataById.get(id), defaultLibraryId, defaultPathId, results, failedCount);
+                    processFileIsolated(file, metadataById.get(id), defaultLibraryId, defaultPathId, results, failedCount);
                     totalFilesProcessed.incrementAndGet();
                 }
             }
@@ -262,14 +268,19 @@ public class BookDropService {
                                                Long defaultPathId) {
         Set<Long> affectedLibraries = new HashSet<>();
 
-        List<BookdropFileEntity> files = bookdropFileRepository.findAllById(ids);
+        // Load the files in chunks to avoid a huge IN clause and to prevent a
+        // cross-chunk auto-flush of pending inserts (see issue #2298).
+        for (int i = 0; i < ids.size(); i += CHUNK_SIZE) {
+            List<Long> chunk = ids.subList(i, Math.min(i + CHUNK_SIZE, ids.size()));
+            List<BookdropFileEntity> files = bookdropFileRepository.findAllById(chunk);
 
-        for (BookdropFileEntity fileEntity : files) {
-            try {
-                FileProcessingContext context = prepareFileProcessingContext(fileEntity, metadataById.get(fileEntity.getId()), defaultLibraryId, defaultPathId);
-                affectedLibraries.add(context.libraryId());
-            } catch (Exception e) {
-                log.warn("Failed to determine library for file {}: {}", fileEntity.getId(), e.getMessage());
+            for (BookdropFileEntity fileEntity : files) {
+                try {
+                    FileProcessingContext context = prepareFileProcessingContext(fileEntity, metadataById.get(fileEntity.getId()), defaultLibraryId, defaultPathId);
+                    affectedLibraries.add(context.libraryId());
+                } catch (Exception e) {
+                    log.warn("Failed to determine library for file {}: {}", fileEntity.getId(), e.getMessage());
+                }
             }
         }
 
@@ -338,6 +349,41 @@ public class BookDropService {
             log.error(msg, e);
             notificationService.sendMessage(Topic.LOG, msg);
         }
+    }
+
+    private void processFileIsolated(BookdropFileEntity fileEntity,
+                                     BookdropFinalizeRequest.BookdropFinalizeFile fileReq,
+                                     Long defaultLibraryId,
+                                     Long defaultPathId,
+                                     BookdropFinalizeResult results,
+                                     AtomicInteger failedCount) {
+        // Each file is processed in its own REQUIRES_NEW transaction so that a
+        // commit-time flush failure (constraint violations, oversized values,
+        // relation conflicts) rolls back only that single file instead of the
+        // whole request.  See issue #2298.
+        AtomicInteger fileFailures = new AtomicInteger();
+        int resultsBefore = results.getResults().size();
+        try {
+            requiresNewTransactionTemplate().executeWithoutResult(
+                    status -> processFile(fileEntity, fileReq, defaultLibraryId, defaultPathId, results, fileFailures));
+        } catch (Exception e) {
+            while (results.getResults().size() > resultsBefore) {
+                results.getResults().remove(results.getResults().size() - 1);
+            }
+            if (fileFailures.get() == 0) {
+                failedCount.incrementAndGet();
+            }
+            String msg = String.format("Error finalizing file [id=%s, name=%s]: %s", fileEntity.getId(), fileEntity.getFileName(), e.getMessage());
+            log.error(msg, e);
+            notificationService.sendMessage(Topic.LOG, msg);
+        }
+        failedCount.addAndGet(fileFailures.get());
+    }
+
+    private TransactionTemplate requiresNewTransactionTemplate() {
+        TransactionTemplate template = new TransactionTemplate(transactionManager);
+        template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        return template;
     }
 
     private FileProcessingContext prepareFileProcessingContext(BookdropFileEntity fileEntity,
@@ -423,6 +469,11 @@ public class BookDropService {
             // Instead, we are using `Files.copy` directly
             Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
 
+            // If the transaction later rolls back (e.g. commit-time flush
+            // failure), remove the target copy again so it cannot turn into an
+            // orphaned file that blocks future imports (see issue #2298).
+            registerTargetRollbackCleanup(target, bookdropFile);
+
             log.info("Copied file id={}, name={} from '{}' to '{}'", bookdropFile.getId(), bookdropFile.getFileName(), source, target);
 
             BookdropFileResult result;
@@ -434,12 +485,9 @@ public class BookDropService {
             }
 
             if (result.isSuccess()) {
-                try {
-                    Files.delete(source);
-                    log.info("Successfully deleted source file '{}' after successful import for file id={}", source, bookdropFile.getId());
-                } catch (IOException e) {
-                    log.warn("Failed to delete source file '{}' after successful import for file id={}: {}", source, bookdropFile.getId(), e.getMessage());
-                }
+                // Delete the source only after the transaction committed so a
+                // rolled-back import keeps the source available for a retry.
+                deleteSourceAfterCommit(source, bookdropFile);
             } else {
                 cleanupTargetFile(target, bookdropFile.getId(), "logical failure");
             }
@@ -538,6 +586,42 @@ public class BookDropService {
             log.warn("Failed to cleanup target file '{}' after {} for file id={}: {}", 
                     target, reason, fileId, e.getMessage());
         }
+    }
+
+    private void deleteSourceAfterCommit(Path source, BookdropFileEntity bookdropFile) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            deleteSourceFile(source, bookdropFile);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                deleteSourceFile(source, bookdropFile);
+            }
+        });
+    }
+
+    private void deleteSourceFile(Path source, BookdropFileEntity bookdropFile) {
+        try {
+            Files.delete(source);
+            log.info("Successfully deleted source file '{}' after successful import for file id={}", source, bookdropFile.getId());
+        } catch (IOException e) {
+            log.warn("Failed to delete source file '{}' after successful import for file id={}: {}", source, bookdropFile.getId(), e.getMessage());
+        }
+    }
+
+    private void registerTargetRollbackCleanup(Path target, BookdropFileEntity bookdropFile) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status == TransactionSynchronization.STATUS_ROLLED_BACK) {
+                    cleanupTargetFile(target, bookdropFile.getId(), "transaction rollback");
+                }
+            }
+        });
     }
 
     private FileProcessResult processFileInLibrary(String fileName, LibraryEntity library, LibraryPathEntity path, File file, BookFileType type) {

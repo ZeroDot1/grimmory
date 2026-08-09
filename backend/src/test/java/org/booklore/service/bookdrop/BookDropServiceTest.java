@@ -41,6 +41,8 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -88,6 +90,10 @@ class BookDropServiceTest {
     private FileMovingHelper fileMovingHelper;
     @Mock
     private ApplicationEventPublisher eventPublisher;
+    @Mock
+    private PlatformTransactionManager transactionManager;
+    @Mock
+    private TransactionStatus transactionStatus;
 
     @InjectMocks
     private BookDropService bookDropService;
@@ -101,6 +107,7 @@ class BookDropServiceTest {
 
     @BeforeEach
     void setUp() throws IOException {
+        lenient().when(transactionManager.getTransaction(any())).thenReturn(transactionStatus);
         LibraryPathEntity libraryPathEntity = new LibraryPathEntity();
         libraryPathEntity.setId(1L);
         libraryPathEntity.setPath(tempDir.toString());

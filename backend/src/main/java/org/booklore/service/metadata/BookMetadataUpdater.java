@@ -24,6 +24,8 @@ import org.booklore.service.metadata.writer.MetadataWriterFactory;
 import org.booklore.util.BookCoverUtils;
 import org.booklore.util.FileService;
 import org.booklore.util.MetadataChangeDetector;
+
+import static org.booklore.util.FileService.truncate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -80,6 +82,11 @@ public class BookMetadataUpdater {
             log.warn("Metadata is null for book ID {}. Skipping update.", bookId);
             return;
         }
+
+        // Normalize the incoming values to the database column widths so that
+        // oversized values cannot fail the transaction at flush time
+        // (see issue #2298).
+        truncateMetadata(newMetadata);
 
         MetadataClearFlags clearFlags = wrapper.getClearFlags();
         BookMetadataEntity metadata = bookEntity.getMetadata();
@@ -172,6 +179,47 @@ public class BookMetadataUpdater {
                 log.warn("Failed to move files for book ID {} after metadata update: {}", bookId, e.getMessage());
             }
         }
+    }
+
+    private void truncateMetadata(BookMetadata metadata) {
+        metadata.setTitle(truncate(metadata.getTitle(), 1000));
+        metadata.setSubtitle(truncate(metadata.getSubtitle(), 1000));
+        metadata.setPublisher(truncate(metadata.getPublisher(), 1000));
+        metadata.setDescription(truncate(metadata.getDescription(), 2000));
+        metadata.setSeriesName(truncate(metadata.getSeriesName(), 1000));
+        metadata.setIsbn13(truncate(metadata.getIsbn13(), 64));
+        metadata.setIsbn10(truncate(metadata.getIsbn10(), 64));
+        metadata.setAsin(truncate(metadata.getAsin(), 20));
+        metadata.setLanguage(truncate(metadata.getLanguage(), 255));
+        metadata.setNarrator(truncate(metadata.getNarrator(), 500));
+        metadata.setContentRating(truncate(metadata.getContentRating(), 20));
+        metadata.setThumbnailUrl(truncate(metadata.getThumbnailUrl(), 2000));
+        metadata.setGoodreadsId(truncate(metadata.getGoodreadsId(), 100));
+        metadata.setComicvineId(truncate(metadata.getComicvineId(), 100));
+        metadata.setHardcoverId(truncate(metadata.getHardcoverId(), 100));
+        metadata.setHardcoverBookId(truncate(metadata.getHardcoverBookId(), 100));
+        metadata.setGoogleId(truncate(metadata.getGoogleId(), 100));
+        metadata.setLubimyczytacId(truncate(metadata.getLubimyczytacId(), 100));
+        metadata.setRanobedbId(truncate(metadata.getRanobedbId(), 100));
+        metadata.setAudibleId(truncate(metadata.getAudibleId(), 100));
+        metadata.setAuthors(truncateList(metadata.getAuthors(), 255));
+        metadata.setCategories(truncateSet(metadata.getCategories(), 255));
+        metadata.setTags(truncateSet(metadata.getTags(), 255));
+        metadata.setMoods(truncateSet(metadata.getMoods(), 255));
+    }
+
+    private List<String> truncateList(List<String> values, int maxLength) {
+        if (values == null) {
+            return null;
+        }
+        return values.stream().map(value -> truncate(value, maxLength)).toList();
+    }
+
+    private Set<String> truncateSet(Set<String> values, int maxLength) {
+        if (values == null) {
+            return null;
+        }
+        return values.stream().map(value -> truncate(value, maxLength)).collect(Collectors.toSet());
     }
 
     private void updateBasicFields(BookMetadata m, BookMetadataEntity e, MetadataClearFlags clear, MetadataReplaceMode replaceMode) {
@@ -410,6 +458,8 @@ public class BookMetadataUpdater {
             return;
         }
 
+        truncateComicMetadata(comicDto);
+
         ComicMetadataEntity comic = e.getComicMetadata();
         if (comic == null) {
             if (!hasComicData(comicDto) && !hasComicLocks(comicDto)) {
@@ -485,8 +535,19 @@ public class BookMetadataUpdater {
         comicCreatorRepository.deleteOrphaned();
     }
 
-    private boolean hasComicData(ComicMetadata dto) {
-        return StringUtils.hasText(dto.getIssueNumber())
+    private void truncateComicMetadata(ComicMetadata comicDto) {
+        comicDto.setIssueNumber(truncate(comicDto.getIssueNumber(), 50));
+        comicDto.setAlternateIssue(truncate(comicDto.getAlternateIssue(), 50));
+        comicDto.setFormat(truncate(comicDto.getFormat(), 50));
+        comicDto.setReadingDirection(truncate(comicDto.getReadingDirection(), 10));
+        comicDto.setVolumeName(truncate(comicDto.getVolumeName(), 255));
+        comicDto.setStoryArc(truncate(comicDto.getStoryArc(), 255));
+        comicDto.setAlternateSeries(truncate(comicDto.getAlternateSeries(), 255));
+        comicDto.setImprint(truncate(comicDto.getImprint(), 255));
+        comicDto.setWebLink(truncate(comicDto.getWebLink(), 1000));
+    }
+
+    private boolean hasComicData(ComicMetadata dto) {        return StringUtils.hasText(dto.getIssueNumber())
                 || StringUtils.hasText(dto.getVolumeName())
                 || dto.getVolumeNumber() != null
                 || StringUtils.hasText(dto.getStoryArc())
